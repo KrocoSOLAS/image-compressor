@@ -1,0 +1,14 @@
+# Build / share artifacts
+image-compressor.zip
+*.zip
+
+# Separate, unrelated project living in the same folder
+Video Compress/
+
+# Local tooling
+.claude/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini

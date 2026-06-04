@@ -1,8 +1,26 @@
 # Image Compress & Convert
 
-A tiny, **100% offline** image compressor and converter that runs entirely in your browser. No server, no uploads — your images never leave your computer.
+A tiny, **100% offline** image compressor and converter that runs entirely in your browser. No server, no uploads, no install — your images never leave your computer.
 
-👉 Open `ImageCompressor.html` in any modern browser (just double-click it).
+## ▶️ How to open the app
+
+Pick whichever is easiest for you:
+
+### Option 1 — Use it online (nothing to download)
+Just open this link:
+
+**https://krocosolas.github.io/image-compressor/**
+
+It runs in your browser; images are still processed locally on your device.
+
+### Option 2 — Run it on your computer (works offline)
+1. Download the project: on the [GitHub page](https://github.com/KrocoSOLAS/image-compressor), click the green **`Code`** button → **Download ZIP**.
+2. **Unzip** it (don't run it from inside the ZIP).
+3. Open the unzipped folder and **double-click `index.html`** — it opens in your default browser.
+
+⚠️ Keep `index.html` and the **`vendor/`** folder together in the same folder. If you separate them, the TIFF/EXR/TGA features stop working (JPEG/PNG/WebP/AVIF still work).
+
+That's it — no installation, and no internet connection needed once downloaded.
 
 ## Features
 
@@ -26,17 +44,15 @@ Standard formats use the browser's built-in Canvas codecs. The extra formats use
 - **EXR** — [parse-exr](https://github.com/repalash/parse-exr) (+ [fflate](https://github.com/101arrowz/fflate))
 - **TGA** — a small hand-written codec
 
-## Run it
+## Run it from a local server (optional)
 
-No build step. Open the HTML file directly, **or** serve the folder:
+Opening `index.html` directly is enough. If you'd rather serve it:
 
 ```bash
 python -m http.server 8000
-# then visit http://localhost:8000/ImageCompressor.html
+# then visit http://localhost:8000/
 ```
-
-Keep `ImageCompressor.html` and the `vendor/` folder together.
 
 ## License
 
-MIT. Bundled libraries retain their own licenses (all MIT).
+MIT — see [LICENSE](LICENSE). Bundled libraries retain their own licenses (all MIT).

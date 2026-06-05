@@ -245,7 +245,7 @@
   <div class="results" id="results"></div>
 </div>
 
-<footer>100% local &middot; Canvas API + bundled UTIF (TIFF), parse-exr (EXR), heic2any (HEIC) &amp; a built-in TGA codec</footer>
+<footer>100% local &middot; Canvas API + bundled UTIF (TIFF), parse-exr (EXR), libheif (HEIC) &amp; a built-in TGA codec</footer>
 
 <!-- Compare modal -->
 <div class="modal hidden" id="compareModal">
@@ -269,7 +269,7 @@
 <script src="vendor/fflate.min.js"></script>
 <script src="vendor/parse-exr.js"></script>
 <script src="vendor/utif.js"></script>
-<script src="vendor/heic2any.min.js"></script>
+<script src="vendor/libheif-bundle.js"></script>
 <script>
 (function () {
   const $ = id => document.getElementById(id);
@@ -436,15 +436,32 @@
     return s;
   }
 
-  // --- HEIC/HEIF (via heic2any → PNG, then standard decode). Input only. ---
+  // --- HEIC/HEIF (via libheif WASM). Input only. ---
+  // libheif() is an emscripten factory returning the module; cache it so a batch
+  // of files doesn't re-initialize the WASM each time.
+  let _libheif = null;
+  async function getLibheif() {
+    if (typeof libheif !== 'function') throw new Error('HEIC decoder not loaded');
+    if (!_libheif) _libheif = await libheif();
+    return _libheif;
+  }
   async function heicToCanvas(file) {
-    if (typeof heic2any !== 'function') throw new Error('HEIC decoder not loaded');
-    let out = await heic2any({ blob: file, toType: 'image/png' });
-    if (Array.isArray(out)) out = out[0]; // multi-image HEIC -> use first frame
-    const img = await loadImage(out);
+    const mod = await getLibheif();
+    const u8 = new Uint8Array(await file.arrayBuffer());
+    const decoder = new mod.HeifDecoder();
+    const images = decoder.decode(u8);
+    if (!images || !images.length) throw new Error('No image found in HEIC');
+    const image = images[0]; // first frame (HEIC can hold bursts/live photos)
+    const w = image.get_width(), h = image.get_height();
     const c = document.createElement('canvas');
-    c.width = img.naturalWidth; c.height = img.naturalHeight;
-    c.getContext('2d').drawImage(img, 0, 0);
+    c.width = w; c.height = h;
+    const ctx = c.getContext('2d');
+    const imageData = ctx.createImageData(w, h);
+    await new Promise((resolve, reject) => {
+      image.display(imageData, d => d ? resolve() : reject(new Error('HEIC decode failed')));
+    });
+    ctx.putImageData(imageData, 0, 0);
+    if (image.free) image.free(); // release native memory between batch items
     return c;
   }
 

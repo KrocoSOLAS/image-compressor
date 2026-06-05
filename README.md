@@ -36,7 +36,7 @@ That's it — no installation, and no internet connection needed once downloaded
 ### Supported input formats
 JPEG, PNG, WebP, GIF, BMP, **TIFF**, **TGA**, **EXR** (HDR, tone-mapped to sRGB), **HEIC/HEIF** (e.g. iPhone photos)
 
-> HEIC is **input only** — you can convert HEIC *to* JPEG/PNG/WebP/etc., but exporting *to* HEIC isn't supported (no client-side HEIC encoder exists). The HEIC decoder (`heic2any`) is ~1.3 MB, so it's the heaviest bundled library.
+> HEIC is **input only** — you can convert HEIC *to* JPEG/PNG/WebP/etc., but exporting *to* HEIC isn't supported (no client-side HEIC encoder exists). The HEIC decoder (`libheif`, ~1.4 MB) is the heaviest bundled library, and it handles modern tiled/grid HEIC such as iPhone photos.
 
 ## How it works
 
@@ -44,7 +44,7 @@ Standard formats use the browser's built-in Canvas codecs. The extra formats use
 
 - **TIFF** — [UTIF.js](https://github.com/photopea/UTIF.js)
 - **EXR** — [parse-exr](https://github.com/repalash/parse-exr) (+ [fflate](https://github.com/101arrowz/fflate))
-- **HEIC/HEIF** — [heic2any](https://github.com/alexcorvi/heic2any) (libheif compiled to WASM, embedded)
+- **HEIC/HEIF** — [libheif-js](https://github.com/catdad-experiments/libheif-js) (current libheif compiled to WASM, embedded)
 - **TGA** — a small hand-written codec
 
 ## Run it from a local server (optional)

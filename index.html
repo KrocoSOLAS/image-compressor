@@ -140,8 +140,8 @@
       <line x1="12" y1="3" x2="12" y2="15"/>
     </svg>
     <div>Drop images here or <strong>browse</strong></div>
-    <small>In: JPEG, PNG, WebP, GIF, BMP, TIFF, TGA, EXR &middot; multiple files supported</small>
-    <input type="file" id="fileInput" accept="image/*,.tif,.tiff,.tga,.exr" multiple class="hidden" />
+    <small>In: JPEG, PNG, WebP, GIF, BMP, TIFF, TGA, EXR, HEIC &middot; multiple files supported</small>
+    <input type="file" id="fileInput" accept="image/*,.tif,.tiff,.tga,.exr,.heic,.heif" multiple class="hidden" />
   </div>
 
   <!-- Output settings -->
@@ -245,7 +245,7 @@
   <div class="results" id="results"></div>
 </div>
 
-<footer>100% local &middot; Canvas API + bundled UTIF (TIFF), parse-exr (EXR) &amp; a built-in TGA codec</footer>
+<footer>100% local &middot; Canvas API + bundled UTIF (TIFF), parse-exr (EXR), heic2any (HEIC) &amp; a built-in TGA codec</footer>
 
 <!-- Compare modal -->
 <div class="modal hidden" id="compareModal">
@@ -269,6 +269,7 @@
 <script src="vendor/fflate.min.js"></script>
 <script src="vendor/parse-exr.js"></script>
 <script src="vendor/utif.js"></script>
+<script src="vendor/heic2any.min.js"></script>
 <script>
 (function () {
   const $ = id => document.getElementById(id);
@@ -287,7 +288,7 @@
   const EXT = { 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/avif': 'avif', 'image/png': 'png', 'image/tiff': 'tiff', 'image/x-tga': 'tga' };
   const isLossy = t => t === 'image/jpeg' || t === 'image/webp' || t === 'image/avif';
   const fileExt = name => (name.split('.').pop() || '').toLowerCase();
-  const isSpecial = file => ['tif', 'tiff', 'tga', 'exr'].includes(fileExt(file.name));
+  const isSpecial = file => ['tif', 'tiff', 'tga', 'exr', 'heic', 'heif'].includes(fileExt(file.name));
 
   function fmtBytes(b) {
     if (b < 1024) return b + ' B';
@@ -429,9 +430,22 @@
     if (e === 'tif' || e === 'tiff') s = tiffToCanvas(await f.arrayBuffer());
     else if (e === 'tga') s = tgaToCanvas(await f.arrayBuffer());
     else if (e === 'exr') s = exrToCanvas(await f.arrayBuffer());
+    else if (e === 'heic' || e === 'heif') s = await heicToCanvas(f);
     else s = await loadImage(f);
     item._src = s;
     return s;
+  }
+
+  // --- HEIC/HEIF (via heic2any → PNG, then standard decode). Input only. ---
+  async function heicToCanvas(file) {
+    if (typeof heic2any !== 'function') throw new Error('HEIC decoder not loaded');
+    let out = await heic2any({ blob: file, toType: 'image/png' });
+    if (Array.isArray(out)) out = out[0]; // multi-image HEIC -> use first frame
+    const img = await loadImage(out);
+    const c = document.createElement('canvas');
+    c.width = img.naturalWidth; c.height = img.naturalHeight;
+    c.getContext('2d').drawImage(img, 0, 0);
+    return c;
   }
 
   // --- TIFF (via UTIF) ---

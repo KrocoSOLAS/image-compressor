@@ -74,7 +74,11 @@
   .check-row span { font-size: 14px; }
   .hint { font-size: 11px; color: var(--muted); margin-top: 6px; }
 
-  .toolbar { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+  .toolbar { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; align-items: center; }
+  .progress { margin-top: 14px; }
+  .progress-track { height: 6px; border-radius: 999px; background: var(--panel-2); border: 1px solid var(--border); overflow: hidden; }
+  .progress-fill { height: 100%; width: 0; background: var(--accent); transition: width .18s linear; }
+  .progress-text { font-size: 12px; color: var(--muted); margin-top: 6px; font-variant-numeric: tabular-nums; }
   button {
     background: var(--accent); color: #fff; border: 0; border-radius: 8px;
     padding: 10px 16px; font-size: 14px; font-weight: 600; cursor: pointer;
@@ -243,6 +247,11 @@
     <button id="clearBtn" class="secondary" disabled>Clear</button>
   </div>
 
+  <div class="progress hidden" id="progressWrap" role="status" aria-live="polite">
+    <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+    <div class="progress-text" id="progressText"></div>
+  </div>
+
   <div class="results" id="results"></div>
 </div>
 
@@ -271,6 +280,169 @@
 <script src="vendor/parse-exr.js"></script>
 <script src="vendor/utif.js"></script>
 <script src="vendor/libheif-bundle.js"></script>
+
+<!--
+  Shared by the page and the worker. The worker's source is literally this
+  block's text followed by the #imgworker block, so the resize geometry and the
+  encoding rules exist in exactly one place instead of being kept in sync by
+  hand. It therefore must not touch `document` or `window` at all: the same text
+  has to run unchanged inside a WorkerGlobalScope.
+-->
+<script id="imgcore">
+(function (g) {
+  const EXT = { 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/avif': 'avif', 'image/png': 'png', 'image/tiff': 'tiff', 'image/x-tga': 'tga' };
+  const isLossy = t => t === 'image/jpeg' || t === 'image/webp' || t === 'image/avif';
+
+  function computeTargetDims(w, h, r) {
+    if (!r || r.kind === 'none') return [w, h];
+    if (r.kind === 'simple') {
+      const cap = r.cap || 0;
+      if (cap > 0 && (w > cap || h > cap)) {
+        const s = Math.min(cap / w, cap / h);
+        return [Math.max(1, Math.round(w * s)), Math.max(1, Math.round(h * s))];
+      }
+      return [w, h];
+    }
+    if (r.mode === 'percent') {
+      const p = (r.pct || 100) / 100;
+      return [Math.max(1, Math.round(w * p)), Math.max(1, Math.round(h * p))];
+    }
+    const tw = r.w || 0, th = r.h || 0;
+    if (r.mode === 'stretch') return [Math.max(1, tw || w), Math.max(1, th || h)];
+    let scale = Infinity;
+    if (tw) scale = Math.min(scale, tw / w);
+    if (th) scale = Math.min(scale, th / h);
+    if (scale === Infinity) return [w, h];
+    return [Math.max(1, Math.round(w * scale)), Math.max(1, Math.round(h * scale))];
+  }
+
+  // Binary-search the highest quality whose encoded size stays under `target`.
+  async function encodeToTargetSize(encode, target) {
+    let lo = 1, hi = 100, best = null, bestQ = null;
+    for (let i = 0; i < 8 && lo <= hi; i++) {
+      const mid = Math.round((lo + hi) / 2);
+      const b = await encode(mid / 100);
+      if (b && b.size <= target) { best = b; bestQ = mid; lo = mid + 1; }
+      else hi = mid - 1;
+    }
+    if (!best) { best = await encode(0.01); bestQ = 1; } // even the floor exceeds target
+    return { blob: best, quality: bestQ };
+  }
+
+  // TGA encode: uncompressed 32-bit BGRA, top-left origin.
+  function encodeTGA(rgba, w, h) {
+    const out = new Uint8Array(18 + w * h * 4);
+    out[2] = 2; // uncompressed truecolor
+    out[12] = w & 255; out[13] = (w >> 8) & 255;
+    out[14] = h & 255; out[15] = (h >> 8) & 255;
+    out[16] = 32; out[17] = 0x28; // 32bpp, top-left origin + 8 alpha bits
+    for (let i = 0, o = 18; i < w * h; i++, o += 4) {
+      out[o] = rgba[i * 4 + 2]; out[o + 1] = rgba[i * 4 + 1]; out[o + 2] = rgba[i * 4]; out[o + 3] = rgba[i * 4 + 3];
+    }
+    return out;
+  }
+
+  // Resize, encode, and render a thumbnail. `env` supplies the two things that
+  // differ between a page and a worker: how to make a canvas, and how to get a
+  // blob out of one. `env.encodeTiff` is page-only, because TIFF encoding needs
+  // UTIF and a worker on a file:// page cannot load the vendor scripts; without
+  // it the pixels are handed back for the page to encode.
+  async function render(src, origW, origH, spec, env) {
+    const [w, h] = computeTargetDims(origW, origH, spec.resize);
+    const canvas = env.makeCanvas(w, h);
+    const ctx = canvas.getContext('2d');
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    if (spec.type === 'image/jpeg') { ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, w, h); }
+    ctx.drawImage(src, 0, 0, w, h);
+
+    const res = { origW, origH, outW: w, outH: h, usedQ: null };
+    if (spec.type === 'image/x-tga') {
+      res.blob = new Blob([encodeTGA(ctx.getImageData(0, 0, w, h).data, w, h)], { type: spec.type });
+    } else if (spec.type === 'image/tiff') {
+      const px = ctx.getImageData(0, 0, w, h).data;
+      if (env.encodeTiff) res.blob = env.encodeTiff(px, w, h);
+      else { res.pixels = px.buffer; res.transfer = [px.buffer]; }
+    } else {
+      const enc = q => env.toBlob(canvas, spec.type, q);
+      if (spec.mode === 'target' && isLossy(spec.type)) {
+        const r = await encodeToTargetSize(enc, spec.targetBytes);
+        res.blob = r.blob; res.usedQ = r.quality;
+      } else {
+        res.blob = await enc(isLossy(spec.type) ? spec.quality : undefined);
+      }
+      // A canvas that cannot encode `type` is specced to hand back a PNG rather
+      // than fail, so a non-null blob is not proof of success.
+      const label = EXT[spec.type].toUpperCase();
+      if (!res.blob) throw new Error('This browser can’t encode ' + label);
+      if (res.blob.type !== spec.type) {
+        throw new Error('This browser can’t encode ' + label + ' (it returned ' + (res.blob.type || 'an unknown type') + ')');
+      }
+    }
+
+    // Thumbnails are blobs so the page never has to hold a full-size canvas.
+    if (spec.thumbMax) {
+      const s = Math.min(1, spec.thumbMax / Math.max(origW, origH));
+      const tw = Math.max(1, Math.round(origW * s)), th = Math.max(1, Math.round(origH * s));
+      const tc = env.makeCanvas(tw, th);
+      const tctx = tc.getContext('2d');
+      tctx.imageSmoothingEnabled = true;
+      tctx.imageSmoothingQuality = 'high';
+      tctx.drawImage(src, 0, 0, tw, th);
+      res.thumb = await env.toBlob(tc, 'image/png');
+    }
+    // The compare slider needs a displayable original. For formats the browser
+    // cannot show by itself, keep it as a blob (which can spill to disk) rather
+    // than as a decoded canvas (which cannot).
+    if (spec.wantOrig) {
+      const oc = env.makeCanvas(origW, origH);
+      oc.getContext('2d').drawImage(src, 0, 0);
+      res.origBlob = await env.toBlob(oc, 'image/png');
+    }
+    return res;
+  }
+
+  g.IMGCORE = { EXT, isLossy, computeTargetDims, encodeToTargetSize, encodeTGA, render };
+})(typeof self !== 'undefined' ? self : this);
+</script>
+
+<!--
+  Worker half. Never executed by the page (unknown script type); its text is
+  concatenated onto #imgcore to build the worker's Blob URL.
+-->
+<script id="imgworker" type="text/js-worker">
+const C = self.IMGCORE;
+const ENV = {
+  makeCanvas: (w, h) => new OffscreenCanvas(w, h),
+  toBlob: (canvas, type, q) => canvas.convertToBlob(q == null ? { type } : { type, quality: q })
+};
+
+self.onmessage = async (ev) => {
+  const job = ev.data;
+  try {
+    let src, origW, origH;
+    if (job.kind === 'blob') {
+      // 'from-image' matches what an <img> does on the page, so EXIF-rotated
+      // photos come out the same way round as they did before.
+      src = await createImageBitmap(job.blob, { imageOrientation: 'from-image' });
+      origW = src.width; origH = src.height;
+    } else {
+      origW = job.pw; origH = job.ph;
+      src = ENV.makeCanvas(origW, origH);
+      src.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(job.pixels), origW, origH), 0, 0);
+    }
+    const res = await C.render(src, origW, origH, job.spec, ENV);
+    if (src.close) src.close();
+    const transfer = res.transfer || [];
+    delete res.transfer;
+    res.id = job.id; res.ok = true;
+    self.postMessage(res, transfer);
+  } catch (err) {
+    self.postMessage({ id: job.id, ok: false, error: (err && err.message) || String(err) });
+  }
+};
+</script>
+
 <script>
 (function () {
   const $ = id => document.getElementById(id);
@@ -282,13 +454,16 @@
   const detailMode = $('detailMode'), widthIn = $('widthIn'), heightIn = $('heightIn'), pctIn = $('pctIn');
   const processBtn = $('processBtn'), downloadAllBtn = $('downloadAllBtn'), clearBtn = $('clearBtn');
   const results = $('results');
+  const progressWrap = $('progressWrap'), progressFill = $('progressFill'), progressText = $('progressText');
+
+  const C = window.IMGCORE;
+  const THUMB_MAX = 112;
 
   let files = [];     // {file, id}
-  let outputs = [];    // {name, url, blob, file, origSize}
+  let outputs = [];    // {name, url, blob, file, origSize, thumbURL, origURL}
 
-  const EXT = { 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/avif': 'avif', 'image/png': 'png', 'image/tiff': 'tiff', 'image/x-tga': 'tga' };
+  const EXT = C.EXT, isLossy = C.isLossy;
   const CANVAS_ENCODED = t => t !== 'image/tiff' && t !== 'image/x-tga'; // the rest we encode ourselves
-  const isLossy = t => t === 'image/jpeg' || t === 'image/webp' || t === 'image/avif';
   const fileExt = name => (name.split('.').pop() || '').toLowerCase();
   const isSpecial = file => ['tif', 'tiff', 'tga', 'exr', 'heic', 'heif'].includes(fileExt(file.name));
 
@@ -362,45 +537,53 @@
   resizeKind.addEventListener('change', updateResizeUI);
   detailMode.addEventListener('change', updateResizeUI);
 
-  // --- Target dimensions ---
-  function computeTarget(w, h) {
-    const kind = resizeKind.value;
-    if (kind === 'none') return [w, h];
-    if (kind === 'simple') {
-      const cap = parseInt(maxDim.value, 10);
-      if (cap > 0 && (w > cap || h > cap)) {
-        const s = Math.min(cap / w, cap / h);
-        return [Math.round(w * s), Math.round(h * s)];
-      }
-      return [w, h];
+  // --- Job spec ---
+  // Read the controls once per run, so a mid-batch fiddle with the sliders can't
+  // give half the files different settings, and so the plain object can be
+  // posted straight to a worker.
+  function readSpec() {
+    const r = { kind: resizeKind.value };
+    if (r.kind === 'simple') r.cap = parseInt(maxDim.value, 10) || 0;
+    if (r.kind === 'detailed') {
+      r.mode = detailMode.value;
+      r.w = parseInt(widthIn.value, 10) || 0;
+      r.h = parseInt(heightIn.value, 10) || 0;
+      r.pct = parseFloat(pctIn.value) || 100;
     }
-    // detailed
-    const mode = detailMode.value;
-    if (mode === 'percent') {
-      const p = (parseFloat(pctIn.value) || 100) / 100;
-      return [Math.max(1, Math.round(w * p)), Math.max(1, Math.round(h * p))];
-    }
-    const tw = parseInt(widthIn.value, 10) || 0;
-    const th = parseInt(heightIn.value, 10) || 0;
-    if (mode === 'stretch') return [tw || w, th || h];
-    // fit
-    let scale = Infinity;
-    if (tw) scale = Math.min(scale, tw / w);
-    if (th) scale = Math.min(scale, th / h);
-    if (scale === Infinity) return [w, h];
-    return [Math.max(1, Math.round(w * scale)), Math.max(1, Math.round(h * scale))];
+    return {
+      type: formatSel.value,
+      quality: quality.value / 100,
+      mode: compMode.value,
+      targetBytes: (parseFloat(targetSize.value) || 200) * 1024,
+      resize: r,
+      thumbMax: THUMB_MAX,
+      wantOrig: false // set per item; only special formats need it
+    };
   }
 
   // --- File intake ---
   function addFiles(list) {
     for (const f of list) if (f.type.startsWith('image/') || isSpecial(f)) files.push({ file: f, id: Math.random().toString(36).slice(2) });
     syncButtons();
-    if (!outputs.length) renderQueue();
+    if (!doneOutputs().length) renderQueue();
   }
+  // Every result holds up to three object URLs; none of them are reclaimed
+  // until they're revoked, so this is the single place that drops a result set.
+  function clearOutputs() {
+    doneOutputs().forEach(o => {
+      URL.revokeObjectURL(o.url);
+      if (o.thumbURL) URL.revokeObjectURL(o.thumbURL);
+      if (o.origURL) URL.revokeObjectURL(o.origURL);
+    });
+    outputs = [];
+  }
+  // `outputs` is indexed by position in the batch, so a file that failed leaves
+  // a hole; everything downstream wants only the ones that produced a blob.
+  const doneOutputs = () => outputs.filter(Boolean);
   function syncButtons() {
     processBtn.disabled = files.length === 0;
-    clearBtn.disabled = files.length === 0 && outputs.length === 0;
-    downloadAllBtn.disabled = outputs.length === 0;
+    clearBtn.disabled = files.length === 0 && doneOutputs().length === 0;
+    downloadAllBtn.disabled = doneOutputs().length === 0;
   }
   function renderQueue() {
     results.innerHTML = '';
@@ -413,11 +596,11 @@
       const thumb = card.querySelector('.thumb');
       const sizesEl = card.querySelector('.sizes');
       if (isSpecial(item.file)) {
-        sizesEl.textContent = fmtBytes(item.file.size) + ' · decoding…';
-        getSource(item).then(s => {
-          thumb.src = s.toDataURL ? s.toDataURL('image/png') : s.src;
-          sizesEl.innerHTML = `${srcW(s)}×${srcH(s)}<br>${fmtBytes(item.file.size)} &middot; queued`;
-        }).catch(err => { sizesEl.innerHTML = `<span class="grow">${escapeHtml(err.message)}</span>`; });
+        // No preview decode here on purpose. Decoding every queued TIFF/EXR/HEIC
+        // up front just to draw a 56px thumbnail meant holding a full-resolution
+        // buffer per file, which is what ran large batches out of memory. These
+        // get their thumbnail once they've been processed.
+        sizesEl.innerHTML = `${escapeHtml(fileExt(item.file.name).toUpperCase())}<br>${fmtBytes(item.file.size)} &middot; queued`;
       } else {
         thumb.onload = () => {
           sizesEl.innerHTML = `${thumb.naturalWidth}×${thumb.naturalHeight}<br>${fmtBytes(item.file.size)} &middot; queued`;
@@ -460,18 +643,17 @@
     return c;
   }
 
-  // Decode + cache the drawable source for an item (decoded once, reused for thumbnail and processing).
-  async function getSource(item) {
-    if (item._src) return item._src;
-    const f = item.file, e = fileExt(f.name);
-    let s;
-    if (e === 'tif' || e === 'tiff') s = tiffToCanvas(await f.arrayBuffer());
-    else if (e === 'tga') s = tgaToCanvas(await f.arrayBuffer());
-    else if (e === 'exr') s = exrToCanvas(await f.arrayBuffer());
-    else if (e === 'heic' || e === 'heif') s = await heicToCanvas(f);
-    else s = await loadImage(f);
-    item._src = s;
-    return s;
+  // Decode one of the formats the browser can't open itself, to raw RGBA.
+  // Deliberately not cached: a cache of full-resolution pixel buffers is what
+  // made a batch of phone photos run the tab out of memory. The buffer is
+  // transferred to a worker straight after this, which hands ownership over.
+  async function decodeSpecial(file) {
+    const e = fileExt(file.name);
+    if (e === 'tif' || e === 'tiff') return decodeTiff(await file.arrayBuffer());
+    if (e === 'tga') return decodeTga(await file.arrayBuffer());
+    if (e === 'exr') return decodeExr(await file.arrayBuffer());
+    if (e === 'heic' || e === 'heif') return decodeHeic(file);
+    throw new Error('Unsupported format: .' + e);
   }
 
   // --- HEIC/HEIF (via libheif WASM). Input only. ---
@@ -483,7 +665,7 @@
     if (!_libheif) _libheif = await libheif();
     return _libheif;
   }
-  async function heicToCanvas(file) {
+  async function decodeHeic(file) {
     const mod = await getLibheif();
     const u8 = new Uint8Array(await file.arrayBuffer());
     const decoder = new mod.HeifDecoder();
@@ -491,31 +673,27 @@
     if (!images || !images.length) throw new Error('No image found in HEIC');
     const image = images[0]; // first frame (HEIC can hold bursts/live photos)
     const w = image.get_width(), h = image.get_height();
-    const c = document.createElement('canvas');
-    c.width = w; c.height = h;
-    const ctx = c.getContext('2d');
-    const imageData = ctx.createImageData(w, h);
+    const imageData = new ImageData(w, h);
     await new Promise((resolve, reject) => {
       image.display(imageData, d => d ? resolve() : reject(new Error('HEIC decode failed')));
     });
-    ctx.putImageData(imageData, 0, 0);
     if (image.free) image.free(); // release native memory between batch items
-    return c;
+    return { data: imageData.data, width: w, height: h };
   }
 
   // --- TIFF (via UTIF) ---
-  function tiffToCanvas(buf) {
+  function decodeTiff(buf) {
     if (typeof UTIF === 'undefined') throw new Error('TIFF decoder not loaded');
     const ifds = UTIF.decode(buf);
     if (!ifds.length) throw new Error('Invalid TIFF');
     const page = ifds[0];
     UTIF.decodeImage(buf, page, ifds);
     const rgba = UTIF.toRGBA8(page);
-    return imageDataToCanvas(new Uint8ClampedArray(rgba), page.width, page.height);
+    return { data: new Uint8ClampedArray(rgba), width: page.width, height: page.height };
   }
 
   // --- EXR (via parse-exr) — HDR float, tone-mapped to 8-bit sRGB ---
-  function exrToCanvas(buf) {
+  function decodeExr(buf) {
     if (typeof parseExr !== 'function') throw new Error('EXR decoder not loaded');
     const exr = parseExr(buf, 1015 /* FloatType -> Float32Array */);
     const { width, height, data, format } = exr;
@@ -557,11 +735,11 @@
         out[o + 3] = Math.max(0, Math.min(255, Math.round(a * 255)));
       }
     }
-    return imageDataToCanvas(out, width, height);
+    return { data: out, width, height };
   }
 
   // --- TGA decode (hand-rolled): truecolor 16/24/32, grayscale 8/16, color-mapped; RLE + raw ---
-  function tgaToCanvas(buf) {
+  function decodeTga(buf) {
     const u8 = new Uint8Array(buf), dv = new DataView(buf);
     const idLen = u8[0], cmapType = u8[1], imgType = u8[2];
     const cmapStart = dv.getUint16(3, true), cmapLen = dv.getUint16(5, true), cmapDepth = u8[7];
@@ -617,20 +795,7 @@
       const y = topToBottom ? row : height - 1 - row;
       out.set(px.subarray(n * 4, n * 4 + 4), (y * width + x) * 4);
     }
-    return imageDataToCanvas(out, width, height);
-  }
-
-  // --- TGA encode: uncompressed 32-bit BGRA, top-left origin ---
-  function encodeTGA(rgba, w, h) {
-    const out = new Uint8Array(18 + w * h * 4);
-    out[2] = 2; // uncompressed truecolor
-    out[12] = w & 255; out[13] = (w >> 8) & 255;
-    out[14] = h & 255; out[15] = (h >> 8) & 255;
-    out[16] = 32; out[17] = 0x28; // 32bpp, top-left origin + 8 alpha bits
-    for (let i = 0, o = 18; i < w * h; i++, o += 4) {
-      out[o] = rgba[i * 4 + 2]; out[o + 1] = rgba[i * 4 + 1]; out[o + 2] = rgba[i * 4]; out[o + 3] = rgba[i * 4 + 3];
-    }
-    return out;
+    return { data: out, width, height };
   }
 
   // --- EXIF helpers (JPEG) ---
@@ -682,38 +847,109 @@
     return merged;
   }
 
-  // --- Core processing ---
-  async function processOne(item) {
-    const src = await getSource(item);
-    const origW = srcW(src), origH = srcH(src);
-    const [w, h] = computeTarget(origW, origH);
-    const canvas = document.createElement('canvas');
-    canvas.width = w; canvas.height = h;
-    const ctx = canvas.getContext('2d');
-    const type = formatSel.value;
-    if (type === 'image/jpeg') { ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, w, h); }
-    ctx.drawImage(src, 0, 0, w, h);
+  // --- Worker pool ---
+  // Built from a Blob URL rather than a separate worker.js, for two reasons:
+  // Chromium refuses `new Worker('worker.js')` on a file:// page ("cannot be
+  // accessed from origin 'null'"), and a Blob URL keeps this app a single file
+  // you can still open by double-clicking. importScripts() is avoided for the
+  // same reason — it fails from a null origin even for a blob: URL — so the
+  // shared #imgcore text is concatenated into the worker source instead.
+  const POOL_SIZE = Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 2) - 1));
+  let workerURL = null, poolProbe = null;
 
-    let blob, usedQ = null;
-    if (type === 'image/tiff') {
-      blob = new Blob([UTIF.encodeImage(ctx.getImageData(0, 0, w, h).data, w, h)], { type });
-    } else if (type === 'image/x-tga') {
-      blob = new Blob([encodeTGA(ctx.getImageData(0, 0, w, h).data, w, h)], { type });
-    } else {
-      const encode = qq => new Promise(res => canvas.toBlob(res, type, qq));
-      if (compMode.value === 'target' && isLossy(type)) {
-        const target = (parseFloat(targetSize.value) || 200) * 1024;
-        const r = await encodeToTargetSize(encode, target);
-        blob = r.blob; usedQ = r.quality;
-      } else {
-        blob = await encode(quality.value / 100);
+  function buildWorkerURL() {
+    if (!workerURL) {
+      const core = $('imgcore').textContent, glue = $('imgworker').textContent;
+      workerURL = URL.createObjectURL(new Blob([core, '\n', glue], { type: 'text/javascript' }));
+    }
+    return workerURL;
+  }
+
+  function runOnWorker(w, job, transfer) {
+    return new Promise((resolve, reject) => {
+      w.onmessage = e => {
+        w.onmessage = w.onerror = null;
+        if (e.data && e.data.ok) resolve(e.data); else reject(new Error((e.data && e.data.error) || 'worker failed'));
+      };
+      w.onerror = e => { w.onmessage = w.onerror = null; reject(new Error(e.message || 'worker failed')); };
+      w.postMessage(job, transfer || []);
+    });
+  }
+
+  // Decide once whether the off-thread path works here. OffscreenCanvas and
+  // convertToBlob are missing in older Safari, so an actual round trip is the
+  // only trustworthy test.
+  function workersUsable() {
+    if (poolProbe) return poolProbe;
+    poolProbe = (async () => {
+      if (typeof Worker === 'undefined' || typeof OffscreenCanvas === 'undefined') return false;
+      let w = null;
+      try {
+        w = new Worker(buildWorkerURL());
+        const px = new Uint8ClampedArray(4 * 4 * 4).fill(180);
+        const res = await Promise.race([
+          runOnWorker(w, { id: 'probe', kind: 'pixels', pixels: px.buffer, pw: 4, ph: 4,
+            spec: { type: 'image/jpeg', quality: 0.8, mode: 'quality', resize: { kind: 'none' }, thumbMax: 0 } }, [px.buffer]),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('probe timed out')), 8000))
+        ]);
+        return !!(res && res.blob);
+      } catch (_) {
+        return false;
+      } finally {
+        if (w) w.terminate();
       }
-      // A canvas that can't encode `type` is specced to hand back a PNG instead of
-      // failing, so a non-null blob is not proof of success — check what we got.
-      if (!blob) throw new Error('This browser can’t encode ' + EXT[type].toUpperCase());
-      if (blob.type !== type) throw new Error('This browser can’t encode ' + EXT[type].toUpperCase() + ' (it returned ' + (blob.type || 'an unknown type') + ')');
+    })();
+    return poolProbe;
+  }
+
+  // --- Page-side rendering (fallback when workers aren't usable) ---
+  const PAGE_ENV = {
+    makeCanvas: (w, h) => { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; },
+    toBlob: (canvas, type, q) => new Promise(res => canvas.toBlob(res, type, q)),
+    encodeTiff: (px, w, h) => new Blob([UTIF.encodeImage(px, w, h)], { type: 'image/tiff' })
+  };
+
+  // --- Core processing ---
+  // `worker` is null on the fallback path. Special formats are always decoded
+  // here on the page, because a worker on a file:// page cannot load the vendor
+  // decoders; only their pixels cross over, transferred rather than copied.
+  async function processOne(item, spec, worker) {
+    const special = isSpecial(item.file);
+    const itemSpec = Object.assign({}, spec, { wantOrig: special });
+    let res;
+
+    if (worker) {
+      const job = { id: item.id, spec: itemSpec };
+      let transfer = [];
+      if (special) {
+        const dec = await decodeSpecial(item.file);
+        job.kind = 'pixels'; job.pw = dec.width; job.ph = dec.height;
+        job.pixels = dec.data.buffer;
+        transfer = [job.pixels];
+      } else {
+        job.kind = 'blob'; job.blob = item.file;
+      }
+      res = await runOnWorker(worker, job, transfer);
+      // TIFF comes back as pixels: UTIF only exists on the page.
+      if (res.pixels) {
+        res.blob = PAGE_ENV.encodeTiff(new Uint8ClampedArray(res.pixels), res.outW, res.outH);
+        delete res.pixels;
+      }
+    } else {
+      let src, origW, origH;
+      if (special) {
+        const dec = await decodeSpecial(item.file);
+        src = imageDataToCanvas(dec.data, dec.width, dec.height);
+        origW = dec.width; origH = dec.height;
+      } else {
+        src = await loadImage(item.file);
+        origW = srcW(src); origH = srcH(src);
+      }
+      res = await C.render(src, origW, origH, itemSpec, PAGE_ENV);
     }
 
+    let blob = res.blob;
+    const type = spec.type;
     // Keep metadata: re-inject original EXIF for JPEG→JPEG
     if (!stripMeta.checked && type === 'image/jpeg' && item.file.type === 'image/jpeg') {
       try {
@@ -725,79 +961,118 @@
 
     const base = item.file.name.replace(/\.[^.]+$/, '');
     return { name: `${base}.${EXT[type]}`, blob, origSize: item.file.size, file: item.file,
-             origW, origH, outW: w, outH: h, usedQ };
+             origW: res.origW, origH: res.origH, outW: res.outW, outH: res.outH,
+             usedQ: res.usedQ, thumb: res.thumb, origBlob: res.origBlob };
   }
 
-  // Binary-search the highest quality whose encoded size stays under `target` bytes.
-  async function encodeToTargetSize(encode, target) {
-    let lo = 1, hi = 100, best = null, bestQ = null;
-    for (let i = 0; i < 8 && lo <= hi; i++) {
-      const mid = Math.round((lo + hi) / 2);
-      const b = await encode(mid / 100);
-      if (b && b.size <= target) { best = b; bestQ = mid; lo = mid + 1; }
-      else hi = mid - 1;
+  function setProgress(done, total) {
+    progressWrap.classList.toggle('hidden', total === 0);
+    progressFill.style.width = total ? (done / total * 100) + '%' : '0';
+    progressText.textContent = total ? `${done} of ${total} done` : '';
+  }
+
+  // Fill in a finished card. Kept separate from the loop because results arrive
+  // out of order once several workers are running.
+  function fillCard(card, index, out, spec) {
+    const url = URL.createObjectURL(out.blob);
+    const thumbURL = out.thumb ? URL.createObjectURL(out.thumb) : null;
+    const origURL = out.origBlob ? URL.createObjectURL(out.origBlob) : null;
+    const rec = { name: out.name, url, blob: out.blob, file: out.file, origSize: out.origSize, thumbURL, origURL };
+    // Slotted by index, not appended: with several lanes running, results land
+    // out of order, and the ZIP should still follow the order of the file list.
+    outputs[index] = rec;
+
+    if (thumbURL) card.querySelector('.thumb').src = thumbURL;
+
+    const delta = out.origSize - out.blob.size;
+    const pct = out.origSize ? Math.round((delta / out.origSize) * 100) : 0;
+    const badge = delta >= 0 ? `<span class="savings">−${pct}%</span>` : `<span class="grow">+${Math.abs(pct)}%</span>`;
+    const dims = (out.outW !== out.origW || out.outH !== out.origH)
+      ? `${out.origW}×${out.origH} → ${out.outW}×${out.outH}`
+      : `${out.outW}×${out.outH}`;
+    let qInfo = '';
+    if (out.usedQ != null) {
+      qInfo = ` &middot; q${out.usedQ}` + (out.blob.size > spec.targetBytes ? ' <span class="grow">(min)</span>' : '');
     }
-    if (!best) { best = await encode(0.01); bestQ = 1; } // even lowest exceeds target
-    return { blob: best, quality: bestQ };
+
+    const sizesEl = card.querySelector('.sizes');
+    sizesEl.classList.remove('spinner');
+    sizesEl.innerHTML = `${dims}<br>${fmtBytes(out.origSize)} → ${fmtBytes(out.blob.size)} &middot; ${badge}${qInfo}`;
+    card.querySelector('.name').textContent = out.name;
+
+    const actions = card.querySelector('.actions');
+    actions.innerHTML = '';
+    const cmpBtn = document.createElement('button');
+    cmpBtn.className = 'secondary tiny'; cmpBtn.textContent = 'Compare';
+    cmpBtn.addEventListener('click', () => openCompare(rec));
+    const a = document.createElement('a');
+    a.href = url; a.download = out.name;
+    a.innerHTML = '<button class="tiny">Download</button>';
+    actions.append(cmpBtn, a);
+    return rec;
+  }
+
+  function failCard(card, message) {
+    const s = card.querySelector('.sizes');
+    s.classList.remove('spinner');
+    s.innerHTML = `<span class="grow">${escapeHtml(message)}</span>`;
   }
 
   processBtn.addEventListener('click', async () => {
     if (!files.length) return;
     processBtn.disabled = true;
-    outputs.forEach(o => URL.revokeObjectURL(o.url));
-    outputs = [];
+    clearOutputs();
     results.innerHTML = '';
 
-    for (const item of files) {
+    const spec = readSpec();
+    const batch = files.slice();
+
+    // Cards go up front, in file order, so the list doesn't reshuffle as
+    // out-of-order results land.
+    const cards = batch.map(item => {
       const card = document.createElement('div');
       card.className = 'card';
       card.innerHTML = `<img class="thumb" alt="" />
         <div class="meta"><div class="name">${escapeHtml(item.file.name)}</div>
-        <div class="sizes spinner">processing…</div></div><div class="actions"></div>`;
-      const thumb = card.querySelector('.thumb');
-      if (!isSpecial(item.file)) thumb.src = URL.createObjectURL(item.file);
+        <div class="sizes spinner">queued…</div></div><div class="actions"></div>`;
+      if (!isSpecial(item.file)) card.querySelector('.thumb').src = URL.createObjectURL(item.file);
       results.appendChild(card);
+      return card;
+    });
 
-      try {
-        const out = await processOne(item);
-        if (isSpecial(item.file) && item._src && item._src.toDataURL) thumb.src = item._src.toDataURL('image/png');
-        const url = URL.createObjectURL(out.blob);
-        const rec = { name: out.name, url, blob: out.blob, file: out.file, origSize: out.origSize, origSrc: item._src };
-        outputs.push(rec);
+    let done = 0;
+    setProgress(0, batch.length);
 
-        const delta = out.origSize - out.blob.size;
-        const pct = out.origSize ? Math.round((delta / out.origSize) * 100) : 0;
-        const badge = delta >= 0 ? `<span class="savings">−${pct}%</span>` : `<span class="grow">+${Math.abs(pct)}%</span>`;
-        const dims = (out.outW !== out.origW || out.outH !== out.origH)
-          ? `${out.origW}×${out.origH} → ${out.outW}×${out.outH}`
-          : `${out.outW}×${out.outH}`;
-        let qInfo = '';
-        if (out.usedQ != null) {
-          const tb = (parseFloat(targetSize.value) || 200) * 1024;
-          qInfo = ` &middot; q${out.usedQ}` + (out.blob.size > tb ? ' <span class="grow">(min)</span>' : '');
+    const useWorkers = await workersUsable();
+    const lanes = useWorkers ? Math.min(POOL_SIZE, batch.length) : 1;
+    const workers = useWorkers ? Array.from({ length: lanes }, () => new Worker(buildWorkerURL())) : [];
+
+    // One lane per worker, each pulling the next index off a shared cursor, so a
+    // slow file doesn't hold up a lane that's free.
+    let cursor = 0;
+    const runLane = async (worker) => {
+      while (true) {
+        const i = cursor++;
+        if (i >= batch.length) return;
+        cards[i].querySelector('.sizes').textContent = 'processing…';
+        try {
+          const out = await processOne(batch[i], spec, worker);
+          fillCard(cards[i], i, out, spec);
+        } catch (err) {
+          failCard(cards[i], err.message);
         }
-
-        const sizesEl = card.querySelector('.sizes');
-        sizesEl.classList.remove('spinner');
-        sizesEl.innerHTML = `${dims}<br>${fmtBytes(out.origSize)} → ${fmtBytes(out.blob.size)} &middot; ${badge}${qInfo}`;
-        card.querySelector('.name').textContent = out.name;
-
-        const actions = card.querySelector('.actions');
-        const cmpBtn = document.createElement('button');
-        cmpBtn.className = 'secondary tiny'; cmpBtn.textContent = 'Compare';
-        cmpBtn.addEventListener('click', () => openCompare(rec));
-        const a = document.createElement('a');
-        a.href = url; a.download = out.name;
-        a.innerHTML = '<button class="tiny">Download</button>';
-        actions.append(cmpBtn, a);
-      } catch (err) {
-        const s = card.querySelector('.sizes');
-        s.classList.remove('spinner');
-        s.innerHTML = `<span class="grow">${escapeHtml(err.message)}</span>`;
+        setProgress(++done, batch.length);
       }
+    };
+
+    try {
+      await Promise.all(useWorkers ? workers.map(runLane) : [runLane(null)]);
+    } finally {
+      workers.forEach(w => w.terminate());
+      setProgress(done, 0);
+      processBtn.disabled = false;
+      syncButtons();
     }
-    processBtn.disabled = false;
-    syncButtons();
   });
 
   // --- ZIP (store, no compression — images are already compressed) ---
@@ -837,11 +1112,12 @@
   }
 
   downloadAllBtn.addEventListener('click', async () => {
-    if (!outputs.length) return;
+    const ready = doneOutputs();
+    if (!ready.length) return;
     downloadAllBtn.disabled = true; downloadAllBtn.textContent = 'Zipping…';
     const used = new Set();
     const entries = [];
-    for (const o of outputs) {
+    for (const o of ready) {
       entries.push({ name: uniqueName(used, o.name), data: new Uint8Array(await o.blob.arrayBuffer()) });
     }
     const zip = buildZip(entries);
@@ -855,10 +1131,10 @@
 
   clearBtn.addEventListener('click', () => {
     files = [];
-    outputs.forEach(o => URL.revokeObjectURL(o.url));
-    outputs = [];
+    clearOutputs();
     results.innerHTML = '';
     fileInput.value = '';
+    setProgress(0, 0);
     syncButtons();
   });
 
@@ -878,9 +1154,10 @@
     cmpComp.onload = () => { sizeOrig(); setSplit(50); };
     cmpOrig.onload = sizeOrig;
     cmpComp.src = rec.url;
-    // Special-format originals can't be shown by the browser directly — use the decoded canvas.
-    if (rec.origSrc && rec.origSrc.toDataURL) {
-      cmpOrig.src = rec.origSrc.toDataURL('image/png');
+    // Special-format originals can't be displayed by the browser directly, so
+    // they were re-encoded to a PNG blob while we had the pixels decoded.
+    if (rec.origURL) {
+      cmpOrig.src = rec.origURL;
     } else {
       cmpOrigURL = URL.createObjectURL(rec.file);
       cmpOrig.src = cmpOrigURL;

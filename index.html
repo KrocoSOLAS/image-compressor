@@ -40,6 +40,7 @@
     background: var(--panel);
   }
   .dropzone.drag { border-color: var(--accent); background: var(--panel-2); }
+  .dropzone:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .dropzone svg { width: 40px; height: 40px; stroke: var(--muted); margin-bottom: 8px; }
   .dropzone strong { color: var(--accent); }
   .dropzone small { display: block; color: var(--muted); margin-top: 6px; }
@@ -133,7 +134,7 @@
 </header>
 
 <div class="container">
-  <div class="dropzone" id="dropzone">
+  <div class="dropzone" id="dropzone" role="button" tabindex="0" aria-label="Choose images to compress, or drop them here">
     <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
       <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
       <polyline points="17 8 12 3 7 8"/>
@@ -286,6 +287,7 @@
   let outputs = [];    // {name, url, blob, file, origSize}
 
   const EXT = { 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/avif': 'avif', 'image/png': 'png', 'image/tiff': 'tiff', 'image/x-tga': 'tga' };
+  const CANVAS_ENCODED = t => t !== 'image/tiff' && t !== 'image/x-tga'; // the rest we encode ourselves
   const isLossy = t => t === 'image/jpeg' || t === 'image/webp' || t === 'image/avif';
   const fileExt = name => (name.split('.').pop() || '').toLowerCase();
   const isSpecial = file => ['tif', 'tiff', 'tga', 'exr', 'heic', 'heif'].includes(fileExt(file.name));
@@ -297,6 +299,38 @@
   }
   function escapeHtml(s) {
     return s.replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+  }
+  // Pick a name not already in `used`, registering whatever we settle on. The
+  // suffixed candidate has to be registered too, or `a.jpg, a.jpg, a_1.jpg`
+  // collides on the third file.
+  function uniqueName(used, name) {
+    let out = name;
+    for (let n = 1; used.has(out); n++) out = name.replace(/(\.[^.]+)$|$/, `_${n}$1`);
+    used.add(out);
+    return out;
+  }
+
+  // Probe the canvas encoders once at startup. Because an unsupported type comes
+  // back as a PNG rather than an error, the only reliable test is to encode a
+  // scratch canvas and look at the resulting blob's type. AVIF notably fails
+  // this in Chromium and Firefox.
+  async function probeEncoders() {
+    const c = document.createElement('canvas');
+    c.width = c.height = 8;
+    const cx = c.getContext('2d');
+    cx.fillStyle = '#888'; cx.fillRect(0, 0, 8, 8);
+    for (const opt of formatSel.options) {
+      if (!CANVAS_ENCODED(opt.value)) continue;
+      const blob = await new Promise(res => c.toBlob(res, opt.value, 0.8));
+      if (!blob || blob.type !== opt.value) {
+        opt.disabled = true;
+        opt.textContent += ' — not supported by this browser';
+      }
+    }
+    if (formatSel.selectedOptions[0] && formatSel.selectedOptions[0].disabled) {
+      const first = [...formatSel.options].find(o => !o.disabled);
+      if (first) { formatSel.value = first.value; updateQualityState(); }
+    }
   }
 
   // --- Control state ---
@@ -396,6 +430,10 @@
 
   // --- Drag & drop ---
   dropzone.addEventListener('click', () => fileInput.click());
+  // The dropzone is a div, so it gets no key handling for free.
+  dropzone.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); }
+  });
   fileInput.addEventListener('change', e => addFiles(e.target.files));
   ['dragenter', 'dragover'].forEach(ev => dropzone.addEventListener(ev, e => { e.preventDefault(); dropzone.classList.add('drag'); }));
   ['dragleave', 'drop'].forEach(ev => dropzone.addEventListener(ev, e => { e.preventDefault(); dropzone.classList.remove('drag'); }));
@@ -483,7 +521,27 @@
     const { width, height, data, format } = exr;
     const ch = format === 1023 ? 4 : 1; // RGBAFormat vs RedFormat
     const out = new Uint8ClampedArray(width * height * 4);
+
+    // Find the brightest colour sample. Plenty of EXRs never leave 0..1, and for
+    // those we want byte-for-byte the old output, so the rolloff below is only
+    // armed when the file genuinely carries highlights above white.
+    let peak = 0;
+    const step = ch === 4 ? 4 : 1;
+    for (let i = 0; i < data.length; i += step) {
+      for (let k = 0; k < (ch === 4 ? 3 : 1); k++) { const v = data[i + k]; if (v > peak) peak = v; }
+    }
+    // Extended Reinhard with the white point set to the image's own peak, which
+    // maps [0, peak] onto [0, 1] smoothly and monotonically: f(peak) is exactly 1,
+    // so the brightest sample lands on white and everything below it keeps some
+    // separation rather than saturating. A fixed knee can't do that — it saturates
+    // a couple of stops above the knee, which for a render with sun values in the
+    // hundreds is barely better than clipping.
+    const rolloff = peak > 1
+      ? c => c * (1 + c / (peak * peak)) / (1 + c)
+      : c => c;
+
     const toSRGB = c => {
+      c = rolloff(Math.max(0, c));
       c = c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
       return Math.max(0, Math.min(255, Math.round(c * 255)));
     };
@@ -650,7 +708,10 @@
       } else {
         blob = await encode(quality.value / 100);
       }
+      // A canvas that can't encode `type` is specced to hand back a PNG instead of
+      // failing, so a non-null blob is not proof of success — check what we got.
       if (!blob) throw new Error('This browser can’t encode ' + EXT[type].toUpperCase());
+      if (blob.type !== type) throw new Error('This browser can’t encode ' + EXT[type].toUpperCase() + ' (it returned ' + (blob.type || 'an unknown type') + ')');
     }
 
     // Keep metadata: re-inject original EXIF for JPEG→JPEG
@@ -754,14 +815,17 @@
     const enc = new TextEncoder();
     const u16 = n => [n & 255, (n >> 8) & 255];
     const u32 = n => [n & 255, (n >> 8) & 255, (n >> 16) & 255, (n >>> 24) & 255];
+    // Names are written as UTF-8, so bit 11 of the general-purpose flags must be
+    // set or unzippers fall back to CP437 and mangle non-ASCII filenames.
+    const UTF8_FLAG = 0x0800;
     const parts = [], central = [];
     let offset = 0;
     for (const e of entries) {
       const name = enc.encode(e.name), data = e.data, crc = crc32(data), size = data.length;
-      const local = new Uint8Array([...u32(0x04034b50), ...u16(20), ...u16(0), ...u16(0), ...u16(0), ...u16(0),
+      const local = new Uint8Array([...u32(0x04034b50), ...u16(20), ...u16(UTF8_FLAG), ...u16(0), ...u16(0), ...u16(0),
         ...u32(crc), ...u32(size), ...u32(size), ...u16(name.length), ...u16(0), ...name]);
       parts.push(local, data);
-      central.push(new Uint8Array([...u32(0x02014b50), ...u16(20), ...u16(20), ...u16(0), ...u16(0), ...u16(0), ...u16(0),
+      central.push(new Uint8Array([...u32(0x02014b50), ...u16(20), ...u16(20), ...u16(UTF8_FLAG), ...u16(0), ...u16(0), ...u16(0),
         ...u32(crc), ...u32(size), ...u32(size), ...u16(name.length), ...u16(0), ...u16(0), ...u16(0), ...u16(0),
         ...u32(0), ...u32(offset), ...name]));
       offset += local.length + size;
@@ -775,13 +839,10 @@
   downloadAllBtn.addEventListener('click', async () => {
     if (!outputs.length) return;
     downloadAllBtn.disabled = true; downloadAllBtn.textContent = 'Zipping…';
-    const seen = {};
+    const used = new Set();
     const entries = [];
     for (const o of outputs) {
-      let name = o.name;
-      if (seen[name] != null) { seen[name]++; name = name.replace(/(\.[^.]+)$/, `_${seen[o.name]}$1`); }
-      else seen[name] = 0;
-      entries.push({ name, data: new Uint8Array(await o.blob.arrayBuffer()) });
+      entries.push({ name: uniqueName(used, o.name), data: new Uint8Array(await o.blob.arrayBuffer()) });
     }
     const zip = buildZip(entries);
     const url = URL.createObjectURL(zip);
@@ -843,6 +904,7 @@
   window.addEventListener('resize', () => { if (!compareModal.classList.contains('hidden')) sizeOrig(); });
 
   updateQualityState(); updateModeUI(); updateMetaHint(); updateResizeUI();
+  probeEncoders();
 })();
 </script>
 </body>

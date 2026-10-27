@@ -127,6 +127,11 @@
   .cmp-divider { position: absolute; top: 0; left: 50%; width: 2px; height: 100%; background: #fff; box-shadow: 0 0 0 1px rgba(0,0,0,.4); transform: translateX(-1px); }
   .cmp-divider::after { content: "⇄"; position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); background: #fff; color: #111; border-radius: 50%; width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; font-size: 14px; }
   .cmp-tag { position: absolute; top: 8px; padding: 3px 8px; font-size: 12px; border-radius: 6px; background: rgba(0,0,0,.6); color: #fff; }
+  .replace-body { font-size: 14px; }
+  .replace-body ul { margin: 10px 0 0; padding-left: 20px; }
+  .replace-body li { margin-bottom: 4px; }
+  .replace-body .warn { color: #ff9b6b; }
+  .saved-note { color: var(--good); font-size: 12px; white-space: nowrap; }
   .cmp-tag.left { left: 8px; }
   .cmp-tag.right { right: 8px; }
 </style>
@@ -241,6 +246,31 @@
     </div>
   </div>
 
+  <!-- Where results go -->
+  <div class="controls" id="savePanel">
+    <div class="field">
+      <label for="saveTo">Save results to</label>
+      <select id="saveTo">
+        <option value="download">Downloads folder</option>
+        <option value="folder">The folder the images came from</option>
+      </select>
+      <div class="hint" id="saveToHint"></div>
+    </div>
+    <div class="field folder-only hidden">
+      <label for="existing">Original files</label>
+      <select id="existing">
+        <option value="keep">Keep them — save results alongside</option>
+        <option value="replace">Replace them with the results</option>
+      </select>
+      <div class="hint" id="existingHint"></div>
+    </div>
+    <div class="field folder-only hidden">
+      <label for="chooseFolderBtn">Source folder</label>
+      <button class="secondary" id="chooseFolderBtn" type="button">Choose folder…</button>
+      <div class="hint" id="folderHint">No folder chosen yet.</div>
+    </div>
+  </div>
+
   <div class="toolbar">
     <button id="processBtn" disabled>Compress &amp; Convert</button>
     <button id="downloadAllBtn" class="secondary" disabled>Download all (ZIP)</button>
@@ -256,6 +286,23 @@
 </div>
 
 <footer>100% local &middot; Canvas API + bundled UTIF (TIFF), parse-exr (EXR), libheif (HEIC) &amp; a built-in TGA codec</footer>
+
+<!-- Replace confirmation. Overwriting and deleting someone's originals is not
+     undoable, so it needs a deliberate acknowledgement every run. -->
+<div class="modal hidden" id="replaceModal">
+  <div class="modal-inner" style="max-width:540px">
+    <div class="modal-head"><div class="title">Replace the original files?</div></div>
+    <div id="replaceBody" class="replace-body"></div>
+    <label class="check-row" style="margin-top:14px">
+      <input type="checkbox" id="replaceAck" />
+      <span>I understand this cannot be undone</span>
+    </label>
+    <div class="toolbar">
+      <button id="replaceGo" disabled>Replace files</button>
+      <button class="secondary" id="replaceCancel">Cancel</button>
+    </div>
+  </div>
+</div>
 
 <!-- Compare modal -->
 <div class="modal hidden" id="compareModal">
@@ -455,11 +502,24 @@ self.onmessage = async (ev) => {
   const processBtn = $('processBtn'), downloadAllBtn = $('downloadAllBtn'), clearBtn = $('clearBtn');
   const results = $('results');
   const progressWrap = $('progressWrap'), progressFill = $('progressFill'), progressText = $('progressText');
+  const saveTo = $('saveTo'), existingSel = $('existing'), chooseFolderBtn = $('chooseFolderBtn');
+  const saveToHint = $('saveToHint'), existingHint = $('existingHint'), folderHint = $('folderHint');
+  const replaceModal = $('replaceModal'), replaceBody = $('replaceBody'), replaceAck = $('replaceAck');
+  const replaceGo = $('replaceGo'), replaceCancel = $('replaceCancel');
 
   const C = window.IMGCORE;
   const THUMB_MAX = 112;
 
-  let files = [];     // {file, id}
+  // Writing results back to the source folder needs the File System Access API,
+  // which is Chromium-only: Firefox has taken the position that the local-disk
+  // pickers are harmful, and Safari ships only the sandboxed private
+  // filesystem. Everything that touches disk is behind this check, and the UI
+  // falls back to downloads where it is false.
+  const CAN_PICK_DIR = typeof window.showDirectoryPicker === 'function';
+  const SUFFIX = '-compressed';
+  const MAX_FOLDER_FILES = 500;
+
+  let files = [];     // {file, id, handle?, dir?, rel?} — handle/dir only when the file came from a picker
   let outputs = [];    // {name, url, blob, file, origSize, thumbURL, origURL}
 
   const EXT = C.EXT, isLossy = C.isLossy;
@@ -530,12 +590,163 @@ self.onmessage = async (ev) => {
       document.querySelectorAll('.percent-only').forEach(e => e.classList.toggle('hidden', !isPct));
     }
   }
+  // How many queued files can actually be written back where they came from.
+  const writableCount = () => files.filter(f => f.handle || f.dir).length;
+
+  function updateSaveUI() {
+    const folder = saveTo.value === 'folder';
+    document.querySelectorAll('.folder-only').forEach(e => e.classList.toggle('hidden', !folder));
+
+    if (!CAN_PICK_DIR) {
+      saveToHint.textContent = 'Saving into the source folder needs Chrome, Edge or Opera. ' +
+        'This browser can only download results.';
+      return;
+    }
+    saveToHint.textContent = folder
+      ? 'Results are written straight to disk — no download prompts.'
+      : 'Each result gets a Download button, or grab them all as one ZIP.';
+
+    const outExt = EXT[formatSel.value];
+    existingHint.innerHTML = existingSel.value === 'replace'
+      ? 'Originals are overwritten in place. Converting to a different format deletes the original. <span class="grow">Cannot be undone.</span>'
+      : `Results are saved next to each original as <code>name${SUFFIX}.${outExt}</code>.`;
+
+    if (!folder) return;
+    const n = writableCount(), total = files.length;
+    if (!total) folderHint.textContent = 'Choose a folder, or drop one onto the box above.';
+    else if (n === total) folderHint.textContent = `${n} file${n === 1 ? '' : 's'} ready to write back.`;
+    else folderHint.innerHTML = `<span class="grow">${total - n} of ${total} file${total === 1 ? '' : 's'} ` +
+      `came from the file picker and can't be written back.</span> Use “Choose folder…”.`;
+  }
+
+  async function pickFolder() {
+    let dir;
+    try {
+      dir = await window.showDirectoryPicker({ mode: 'readwrite' });
+    } catch (err) {
+      if (err && err.name === 'AbortError') return; // user closed the picker
+      folderHint.innerHTML = `<span class="grow">${escapeHtml(err.message || 'Could not open that folder')}</span>`;
+      return;
+    }
+    if (!(await ensureWritable(dir))) {
+      folderHint.innerHTML = '<span class="grow">Write permission was declined for that folder.</span>';
+      return;
+    }
+    chooseFolderBtn.disabled = true;
+    const prev = chooseFolderBtn.textContent;
+    chooseFolderBtn.textContent = 'Scanning…';
+    try {
+      const found = [];
+      await collectFromDir(dir, '', found, 0);
+      if (!found.length) {
+        folderHint.innerHTML = '<span class="grow">No images found in that folder.</span>';
+        return;
+      }
+      // A picked folder replaces the queue, so what's listed matches what will
+      // be written back.
+      files = [];
+      clearOutputs();
+      results.innerHTML = '';
+      addEntries(found);
+      const capped = found.length >= MAX_FOLDER_FILES ? ` (stopped at ${MAX_FOLDER_FILES})` : '';
+      folderHint.textContent = `${dir.name}: ${found.length} image${found.length === 1 ? '' : 's'}${capped}.`;
+    } finally {
+      chooseFolderBtn.disabled = false;
+      chooseFolderBtn.textContent = prev;
+    }
+  }
+
+  if (!CAN_PICK_DIR) {
+    saveTo.querySelector('option[value="folder"]').disabled = true;
+    chooseFolderBtn.disabled = true;
+  }
+  chooseFolderBtn.addEventListener('click', pickFolder);
+  saveTo.addEventListener('change', updateSaveUI);
+  existingSel.addEventListener('change', updateSaveUI);
+  formatSel.addEventListener('change', updateSaveUI);
+
   quality.addEventListener('input', () => qualityVal.textContent = quality.value + '%');
   formatSel.addEventListener('change', updateQualityState);
   compMode.addEventListener('change', updateModeUI);
   stripMeta.addEventListener('change', updateMetaHint);
   resizeKind.addEventListener('change', updateResizeUI);
   detailMode.addEventListener('change', updateResizeUI);
+
+  // --- Saving into the source folder (File System Access API) ---
+  const isAcceptable = f => f.type.startsWith('image/') || isSpecial(f);
+  // Don't re-compress our own output when a folder is processed twice.
+  const isOurOutput = name => name.replace(/\.[^.]+$/, '').endsWith(SUFFIX);
+
+  async function ensureWritable(handle) {
+    if (!handle || !handle.queryPermission) return true;
+    if (await handle.queryPermission({ mode: 'readwrite' }) === 'granted') return true;
+    return (await handle.requestPermission({ mode: 'readwrite' })) === 'granted';
+  }
+
+  async function nameTaken(dir, name) {
+    try { await dir.getFileHandle(name); return true; }
+    catch (_) { return false; }
+  }
+  async function freeName(dir, name) {
+    if (!(await nameTaken(dir, name))) return name;
+    for (let n = 1; n < 1000; n++) {
+      const cand = name.replace(/(\.[^.]+)$|$/, `_${n}$1`);
+      if (!(await nameTaken(dir, cand))) return cand;
+    }
+    throw new Error('No free filename in that folder');
+  }
+  async function writeBlob(handle, blob) {
+    const w = await handle.createWritable();
+    try { await w.write(blob); } finally { await w.close(); }
+  }
+
+  async function collectFromDir(dir, rel, out, depth) {
+    if (depth > 8 || out.length >= MAX_FOLDER_FILES) return;
+    for await (const entry of dir.values()) {
+      if (out.length >= MAX_FOLDER_FILES) return;
+      if (entry.kind === 'directory') {
+        await collectFromDir(entry, rel + entry.name + '/', out, depth + 1);
+      } else if (entry.kind === 'file' && !isOurOutput(entry.name)) {
+        let f;
+        try { f = await entry.getFile(); } catch (_) { continue; }
+        if (isAcceptable(f)) out.push({ file: f, handle: entry, dir, rel });
+      }
+    }
+  }
+
+  // What saving this item will actually do on disk. Computed before the run so
+  // the confirmation can state it, and reused when the write happens.
+  function plannedWrite(item, type) {
+    const outExt = EXT[type];
+    const origName = item.file.name;
+    const sameExt = fileExt(origName) === outExt;
+    const base = origName.replace(/\.[^.]+$/, '');
+    if (existingSel.value === 'replace') {
+      if (sameExt) return { action: 'overwrite', name: origName };
+      if (item.dir) return { action: 'convert', name: base + '.' + outExt, remove: origName };
+      return { action: 'blocked', why: 'Replacing a ' + fileExt(origName).toUpperCase() +
+        ' with a ' + outExt.toUpperCase() + ' has to delete the original, which needs the whole folder — use “Choose folder…”.' };
+    }
+    if (item.dir) return { action: 'alongside', name: base + SUFFIX + '.' + outExt };
+    return { action: 'blocked', why: 'Saving alongside the original needs the whole folder — use “Choose folder…”.' };
+  }
+
+  async function saveIntoFolder(item, blob, plan) {
+    if (plan.action === 'blocked') throw new Error(plan.why);
+    if (plan.action === 'overwrite') {
+      if (!(await ensureWritable(item.handle))) throw new Error('Write permission denied');
+      await writeBlob(item.handle, blob);
+      return plan.name;
+    }
+    if (!(await ensureWritable(item.dir))) throw new Error('Write permission denied');
+    // Only now resolve the final name: another file in this same batch may have
+    // taken it since the plan was drawn up.
+    const name = await freeName(item.dir, plan.name);
+    await writeBlob(await item.dir.getFileHandle(name, { create: true }), blob);
+    // Remove the original only once the replacement is safely written.
+    if (plan.remove && plan.remove !== name) await item.dir.removeEntry(plan.remove);
+    return name;
+  }
 
   // --- Job spec ---
   // Read the controls once per run, so a mid-batch fiddle with the sliders can't
@@ -562,10 +773,14 @@ self.onmessage = async (ev) => {
   }
 
   // --- File intake ---
-  function addFiles(list) {
-    for (const f of list) if (f.type.startsWith('image/') || isSpecial(f)) files.push({ file: f, id: Math.random().toString(36).slice(2) });
+  function addEntries(entries) {
+    for (const e of entries) files.push(Object.assign({ id: Math.random().toString(36).slice(2) }, e));
     syncButtons();
+    updateSaveUI();
     if (!doneOutputs().length) renderQueue();
+  }
+  function addFiles(list) {
+    addEntries([...list].filter(isAcceptable).map(f => ({ file: f })));
   }
   // Every result holds up to three object URLs; none of them are reclaimed
   // until they're revoked, so this is the single place that drops a result set.
@@ -620,7 +835,29 @@ self.onmessage = async (ev) => {
   fileInput.addEventListener('change', e => addFiles(e.target.files));
   ['dragenter', 'dragover'].forEach(ev => dropzone.addEventListener(ev, e => { e.preventDefault(); dropzone.classList.add('drag'); }));
   ['dragleave', 'drop'].forEach(ev => dropzone.addEventListener(ev, e => { e.preventDefault(); dropzone.classList.remove('drag'); }));
-  dropzone.addEventListener('drop', e => { if (e.dataTransfer.files) addFiles(e.dataTransfer.files); });
+  dropzone.addEventListener('drop', async e => {
+    // Chromium hands over a filesystem handle per dropped item, which is what
+    // lets a dropped folder be written back to as well as read from. Without it
+    // (Firefox, Safari) we only get the files themselves.
+    const items = e.dataTransfer.items ? [...e.dataTransfer.items] : [];
+    if (CAN_PICK_DIR && items.length && items[0].getAsFileSystemHandle) {
+      const handles = await Promise.all(items.map(i =>
+        i.kind === 'file' ? i.getAsFileSystemHandle().catch(() => null) : null));
+      const found = [];
+      for (const h of handles) {
+        if (!h) continue;
+        if (h.kind === 'directory') {
+          if (await ensureWritable(h)) await collectFromDir(h, '', found, 0);
+        } else {
+          let f;
+          try { f = await h.getFile(); } catch (_) { continue; }
+          if (isAcceptable(f)) found.push({ file: f, handle: h, dir: null, rel: '' });
+        }
+      }
+      if (found.length) { addEntries(found); return; }
+    }
+    if (e.dataTransfer.files) addFiles(e.dataTransfer.files);
+  });
 
   // --- Image loading ---
   function loadImage(file) {
@@ -1012,20 +1249,83 @@ self.onmessage = async (ev) => {
     return rec;
   }
 
+  // Spell out exactly what will be overwritten and what will be deleted, and
+  // require a tick plus a click. Resolves false if anything is declined.
+  function confirmReplace(plans) {
+    const overwrite = plans.filter(p => p.action === 'overwrite');
+    const converted = plans.filter(p => p.action === 'convert');
+    const blocked = plans.filter(p => p.action === 'blocked');
+    if (!overwrite.length && !converted.length) return Promise.resolve(true);
+
+    const bits = [];
+    if (overwrite.length) bits.push(`<li><strong>${overwrite.length}</strong> file${overwrite.length === 1 ? '' : 's'} overwritten in place</li>`);
+    if (converted.length) bits.push(`<li><strong>${converted.length}</strong> original${converted.length === 1 ? '' : 's'} <span class="warn">deleted</span> after the converted file is written</li>`);
+    if (blocked.length) bits.push(`<li>${blocked.length} skipped (can't be written back)</li>`);
+    const sample = overwrite.concat(converted).slice(0, 3).map(p => p.remove || p.name);
+    replaceBody.innerHTML = `This will change files on your disk:<ul>${bits.join('')}</ul>` +
+      `<div class="hint" style="margin-top:10px">e.g. ${escapeHtml(sample.join(', '))}` +
+      `${overwrite.length + converted.length > 3 ? ', …' : ''}</div>`;
+
+    replaceAck.checked = false;
+    replaceGo.disabled = true;
+    replaceModal.classList.remove('hidden');
+    replaceGo.textContent = `Replace ${overwrite.length + converted.length} file` +
+      (overwrite.length + converted.length === 1 ? '' : 's');
+
+    return new Promise(resolve => {
+      const finish = (ok) => {
+        replaceModal.classList.add('hidden');
+        replaceAck.onchange = replaceGo.onclick = replaceCancel.onclick = null;
+        window.removeEventListener('keydown', onKey);
+        resolve(ok);
+      };
+      const onKey = ev => { if (ev.key === 'Escape') finish(false); };
+      replaceAck.onchange = () => { replaceGo.disabled = !replaceAck.checked; };
+      replaceGo.onclick = () => finish(true);
+      replaceCancel.onclick = () => finish(false);
+      window.addEventListener('keydown', onKey);
+    });
+  }
+
   function failCard(card, message) {
     const s = card.querySelector('.sizes');
     s.classList.remove('spinner');
     s.innerHTML = `<span class="grow">${escapeHtml(message)}</span>`;
   }
+  function noteOnCard(card, text, bad) {
+    const s = card.querySelector('.sizes');
+    const el = document.createElement('div');
+    el.className = bad ? 'grow' : 'saved-note';
+    el.style.fontSize = '12px';
+    el.textContent = text;
+    s.appendChild(el);
+  }
+  // Once a file is on disk its Download button is redundant, so swap it for the
+  // name it was written as.
+  function markSaved(card, savedAs) {
+    const a = card.querySelector('.actions a');
+    if (a) a.remove();
+    noteOnCard(card, 'Saved as ' + savedAs, false);
+  }
 
   processBtn.addEventListener('click', async () => {
     if (!files.length) return;
     processBtn.disabled = true;
-    clearOutputs();
-    results.innerHTML = '';
 
     const spec = readSpec();
     const batch = files.slice();
+    const toFolder = saveTo.value === 'folder' && CAN_PICK_DIR;
+
+    // Work out what hits the disk before encoding anything, so the warning is
+    // accurate and backing out costs no work and loses no previous results.
+    const plans = toFolder ? batch.map(item => plannedWrite(item, spec.type)) : null;
+    if (toFolder && existingSel.value === 'replace' && !(await confirmReplace(plans))) {
+      processBtn.disabled = false;
+      return;
+    }
+
+    clearOutputs();
+    results.innerHTML = '';
 
     // Cards go up front, in file order, so the list doesn't reshuffle as
     // out-of-order results land.
@@ -1055,11 +1355,22 @@ self.onmessage = async (ev) => {
         const i = cursor++;
         if (i >= batch.length) return;
         cards[i].querySelector('.sizes').textContent = 'processing…';
+        let out = null;
         try {
-          const out = await processOne(batch[i], spec, worker);
+          out = await processOne(batch[i], spec, worker);
           fillCard(cards[i], i, out, spec);
         } catch (err) {
           failCard(cards[i], err.message);
+        }
+        // Saving is its own step: a refused write shouldn't wipe the size and
+        // dimension figures that were just measured, and the Download button
+        // stays as the way out.
+        if (out && toFolder) {
+          try {
+            markSaved(cards[i], await saveIntoFolder(batch[i], out.blob, plans[i]));
+          } catch (err) {
+            noteOnCard(cards[i], 'Not saved: ' + err.message, true);
+          }
         }
         setProgress(++done, batch.length);
       }
@@ -1180,7 +1491,7 @@ self.onmessage = async (ev) => {
   window.addEventListener('keydown', e => { if (e.key === 'Escape') closeCompare(); });
   window.addEventListener('resize', () => { if (!compareModal.classList.contains('hidden')) sizeOrig(); });
 
-  updateQualityState(); updateModeUI(); updateMetaHint(); updateResizeUI();
+  updateQualityState(); updateModeUI(); updateMetaHint(); updateResizeUI(); updateSaveUI();
   probeEncoders();
 })();
 </script>
